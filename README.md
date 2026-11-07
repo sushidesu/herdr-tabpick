@@ -2,12 +2,13 @@
 
 A tab picker for [herdr](https://herdr.dev). One key lists every tab across
 every workspace, most recently used first, with a live preview of the pane you
-would land in. Tabs are the only unit it deals in.
+would land in. A tab with several panes opens into a tree of them, so you can
+jump straight to one pane.
 
 ## Requirements
 
 - herdr 0.7.4 or newer
-- `fzf` and `jq` on `PATH`
+- `fzf` 0.71 or newer, `jq`, and `nc` with Unix socket support (`-U`) on `PATH`
 
 ## Install
 
@@ -31,13 +32,17 @@ Reload with `herdr server reload-config`.
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Move down / up |
-| `l` / `enter` | Focus the tab, or create one in the selected directory |
-| `h` / `q` / `esc` | Close the picker |
+| `l` | Expand a collapsed multi-pane tab (`▸`) into its panes; on any other row, the same as `enter` |
+| `h` | Collapse the tab under the cursor, or the tab of the pane under the cursor |
+| `enter` | Focus the tab or pane, or create a tab in the selected directory |
+| `q` / `esc` | Close the picker |
 | `g` / `G` | First / last |
-| `x` / `ctrl-x` | Close the selected tabs |
+| `x` / `ctrl-x` | Close the selected tabs and panes |
 | `ctrl-n` | Make a new directory named by your query under the first configured root, and open a tab there — needs the `roots` file below |
 | `tab` | Toggle multi-select |
-| `/` | Search mode — every key types into the query; `esc` returns to nav mode and the query keeps filtering |
+| `/` | Expand every tab, so panes can match too, and enter search mode — every key types into the query; `esc` returns to nav mode and the query keeps filtering |
+
+Tabs start collapsed each time the picker opens.
 
 ## Optional: tabs you have not opened yet
 

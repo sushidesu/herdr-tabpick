@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # tabpick — pick a herdr tab, most recently used first.
 #
-# Every row resolves to "which tab do I want to be in". Tabs that exist are
-# focused; directories are tabs that do not exist yet, and selecting one creates
-# it. Workspaces are not a unit here — a tab's workspace is shown only when
-# there is more than one to tell apart.
+# Every row resolves to "where do I want to be". Tabs that exist are focused;
+# directories are tabs that do not exist yet, and selecting one creates it.
+# A tab with several panes is a tree node: opened, it lists its panes, and
+# selecting one focuses that exact pane. Workspaces are not a unit here — a
+# tab's workspace is shown only when there is more than one to tell apart.
 #
 # Candidates, in this order:
 #   - existing tabs, most recently focused first, with a live pane preview
-#     (recency comes from this plugin's tab.focused hook; see herdr-plugin.toml)
+#     (recency comes from this plugin's tab.focused hook; see herdr-plugin.toml),
+#     each followed by its panes while the tab is opened
 #   - subdirectories of the configured roots
 # Directories already open as a tab are dropped, so a row never appears twice.
 # Jumping to an arbitrary directory is zoxide's job, not this picker's: rows
@@ -16,14 +18,18 @@
 #
 # Keys — nav mode (default):
 #   j / k       → move down / up
-#   l / enter   → open: focus the tab, or create one in the directory
-#   h / q / esc → close the picker
+#   l           → open a closed multi-pane tab into its panes; on any other row,
+#                 the same as enter
+#   h           → close the tab under the cursor, or the tab a pane row belongs to
+#   enter       → focus the tab or pane, or create a tab in the directory
+#   q / esc     → close the picker
 #   g / G       → first / last
-#   x / ctrl-x  → close selected tabs (directory rows are ignored), reload
+#   x / ctrl-x  → close selected tabs and panes (directory rows are ignored), reload
 #   ctrl-n      → create <first root>/<query> and open a tab there (modifier-keyed
 #                 so it also works while typing the name in search mode)
 #   tab         → toggle multi-select
-#   /           → search mode (all keys type into the query);
+#   /           → open every tab, then search mode (all keys type into the
+#                 query) — a pane can only match while its tab is opened;
 #                 esc returns to nav mode, the query keeps filtering
 #
 # Configuration — $HERDR_PLUGIN_CONFIG_DIR/roots, one directory per line, `~`
@@ -31,10 +37,14 @@
 # is where ctrl-n creates new ones, so the order is meaningful. Without the file
 # the picker offers open tabs only.
 #
-# Subcommands (both are invoked by fzf, not by hand):
-#   tabpick        open the picker
-#   tabpick list   print candidate lines (fzf reload)
-#   tabpick new N  create <first root>/N and open a tab there (ctrl-n)
+# Subcommands (all but the first are invoked by fzf, not by hand):
+#   tabpick                  open the picker
+#   tabpick list             print candidate lines (fzf reload)
+#   tabpick new N            create <first root>/N and open a tab there (ctrl-n)
+#   tabpick right KEY NODE   print the fzf action for l
+#   tabpick left TYPE KEY NODE  print the fzf action for h
+#   tabpick open-all         open every multi-pane tab (/)
+#   tabpick close FILE       close the tabs and panes listed in FILE (x)
 
 set -euo pipefail
 
@@ -43,12 +53,15 @@ set -euo pipefail
 : "${HERDR_BIN_PATH:?tabpick: must be started by herdr as a plugin pane}"
 : "${HERDR_PLUGIN_STATE_DIR:?tabpick: must be started by herdr as a plugin pane}"
 : "${HERDR_PLUGIN_CONFIG_DIR:?tabpick: must be started by herdr as a plugin pane}"
+: "${HERDR_SOCKET_PATH:?tabpick: must be started by herdr as a plugin pane}"
 
 # exported so the fzf preview, which runs in its own shell, resolves it too
 export HERDR="$HERDR_BIN_PATH"
 
 # one empty file per tab, named by tab_id, mtime = when it was last focused
 MRU_DIR="$HERDR_PLUGIN_STATE_DIR/tabs"
+
+self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
 
 # One directory per line; `~` is expanded here so the file can be written the
 # way a person would type it.
@@ -74,15 +87,24 @@ fetch_tabs() {
       done
 }
 
-# Fields (tab-separated): type, target, preview pane, display, cwd.
+# Fields (tab-separated): type, target, preview pane, display, cwd, node key,
+# node state.
 #   type T → target is a tab_id, preview pane is its focused/first pane
+#   type P → target and preview pane are a pane_id
 #   type D → target is a directory, preview pane is "-"
+# The node key is the tab_id for T and for P — a pane row stands for its tab —
+# and the path for D. fzf identifies rows by it (--id-nth), so after a reload
+# the cursor lands on the same tab, and closing a tab from one of its pane rows
+# moves the cursor up onto the tab: its first row with that key.
+# The node state is "closed" or "open" for a tab with more than one pane, and
+# "leaf" for every other row.
 # cwd stays absolute for deduping; the display copy is ~-shortened.
 list_tabs() {
   local mru=""
   # -tr lists oldest first, which is the order the $rank map below expects
   [[ -d "$MRU_DIR" ]] && mru=$(ls -tr "$MRU_DIR")
-  fetch_tabs | jq -rs --arg home "$HOME" --arg mru "$mru" '
+  fetch_tabs | jq -rs --arg home "$HOME" --arg mru "$mru" \
+    --arg opened "$(<"$TABPICK_OPEN_TABS")" '
     def short: if startswith($home) then "~" + .[($home | length):] else . end;
     def status:
       {blocked: "\u001b[31m● blocked\u001b[0m",
@@ -99,27 +121,45 @@ list_tabs() {
     # more recent. tabs never focused since the plugin was installed have no entry.
     | ($mru | split("\n") | map(select(length > 0))
         | to_entries | reduce .[] as $e ({}; .[$e.value] = ($e.key))) as $rank
+    | ($opened | split("\n") | map({key: ., value: true}) | from_entries) as $open
+    # the workspace is noise until there is more than one of them
+    | (if ($ws | length) > 1 then 14 else 3 end) as $colw
     | [.[] | select(.type == "tab_list").tabs[]]
     # most recent first; tabs with no focus record fall to the end by number
     | sort_by([ -($rank[.tab_id] // -1), .number ])[]
-    | ($panes[.tab_id] // []) as $pp
+    | .tab_id as $tab
+    | ($panes[$tab] // []) as $pp
     | (($pp | map(select(.focused))) + $pp)[0] as $p0
     | ($p0.foreground_cwd // $p0.cwd // "") as $abs
     | ([$pp[].agent? // empty] | unique | join(" ")) as $agents
-    # the workspace is noise until there is more than one of them
-    | (if ($ws | length) > 1 then 14 else 3 end) as $colw
+    | (if .pane_count < 2 then "leaf" elif $open[$tab] then "open" else "closed" end) as $node
     | (if ($ws | length) > 1
        then ($wsl[.workspace_id] // .workspace_id) + ":" + (.number | tostring)
        else .number | tostring
        end) as $col
-    | [ "T", .tab_id, ($p0.pane_id // "-"),
-        ("\u001b[34m" + (($col + " " * $colw)[0:$colw]) + "\u001b[0m " + .label
+    | [ "T", $tab, ($p0.pane_id // "-"),
+        ("\u001b[34m" + (($col + " " * $colw)[0:$colw]) + "\u001b[0m "
+          + {leaf: " ", closed: "▸", open: "▾"}[$node] + " " + .label
           + (if .pane_count > 1 then " \u001b[33m(\(.pane_count)p)\u001b[0m" else "" end)
           + (if $agents != "" then " \u001b[35m\($agents)\u001b[0m" else "" end)
           + (.agent_status | status)
           + "  \u001b[90m\($abs | short)\u001b[0m"),
-        $abs
-      ]
+        $abs, $tab, $node
+      ],
+      (if $node == "open" then
+         $pp | to_entries[]
+         | (if .key == ($pp | length) - 1 then "└" else "├" end) as $edge
+         | .value
+         | (.foreground_cwd // .cwd // "") as $pabs
+         | [ "P", .pane_id, .pane_id,
+             (" " * ($colw + 3) + "\u001b[90m" + $edge + "\u001b[0m "
+               + (.terminal_title_stripped // "" | if . == "" then "pane" else . end)
+               + (if .agent then " \u001b[35m\(.agent)\u001b[0m" else "" end)
+               + (.agent_status | status)
+               + "  \u001b[90m\($pabs | short)\u001b[0m"),
+             $pabs, $tab, "leaf"
+           ]
+       else empty end)
     | @tsv'
 }
 
@@ -127,7 +167,9 @@ candidates() {
   local tabs seen root path short
   tabs=$(list_tabs)
   [[ -n "$tabs" ]] && printf '%s\n' "$tabs"
-  seen=$'\n'$(cut -f5 <<<"$tabs")$'\n'
+  # only tab rows: whether a directory is open as a tab must not depend on
+  # which tabs happen to be expanded
+  seen=$'\n'$(awk -F'\t' '$1 == "T" { print $5 }' <<<"$tabs")$'\n'
 
   while IFS= read -r root; do
     [[ -d "$root" ]] || continue
@@ -137,7 +179,7 @@ candidates() {
       case "$seen" in *$'\n'"$path"$'\n'*) continue ;; esac
       seen+="$path"$'\n'
       short="${path/#$HOME/~}"
-      printf 'D\t%s\t-\t    %s\t%s\n' "$path" "$short" "$path"
+      printf 'D\t%s\t-\t    %s\t%s\t%s\tleaf\n' "$path" "$short" "$path" "$path"
     done
   done < <(roots)
 }
@@ -161,12 +203,70 @@ new_project() {
   "$HERDR" tab create --cwd "$dir" --label "${dir##*/}" --focus >/dev/null
 }
 
+# Re-list with the cursor kept on the same node key (see --id-nth).
+reload_list="track-current+reload('$self' list)"
+
+# l: a closed tab opens; every other row is a destination, so l takes it.
+on_right() {
+  local key="$1" node="$2"
+  if [[ "$node" == closed ]]; then
+    printf '%s\n' "$key" >>"$TABPICK_OPEN_TABS"
+    printf '%s\n' "$reload_list"
+  else
+    printf 'accept\n'
+  fi
+}
+
+# h: closes the tab the cursor is in — the tab row itself, or the tab a pane
+# row belongs to (its node key). Anywhere else there is nothing to close.
+on_left() {
+  local type="$1" key="$2" node="$3"
+  [[ "$type" == P || "$node" == open ]] || return 0
+  { grep -vxF -- "$key" "$TABPICK_OPEN_TABS" || true; } >"$TABPICK_OPEN_TABS.new"
+  mv "$TABPICK_OPEN_TABS.new" "$TABPICK_OPEN_TABS"
+  printf '%s\n' "$reload_list"
+}
+
+open_all_tabs() {
+  fetch_tabs \
+    | jq -rs '.[].result | select(.type == "tab_list").tabs[]
+              | select(.pane_count > 1).tab_id' >"$TABPICK_OPEN_TABS"
+}
+
+# FILE holds the selected candidate lines; directory rows have nothing to close.
+close_rows() {
+  local type target
+  while IFS=$'\t' read -r type target _; do
+    case "$type" in
+      T) "$HERDR" tab close "$target" >/dev/null ;;
+      P) "$HERDR" pane close "$target" >/dev/null ;;
+    esac
+  done <"$1"
+}
+
+# The CLI has no command that focuses a given pane (`pane focus` only moves to a
+# neighbor), so this speaks the socket API's pane.focus directly. It also
+# switches to the pane's tab and workspace.
+focus_pane() {
+  local response
+  response=$(jq -nc --arg id "$1" '{id: "tabpick", method: "pane.focus", params: {pane_id: $id}}' \
+    | nc -U "$HERDR_SOCKET_PATH")
+  jq -e 'has("result")' <<<"$response" >/dev/null || {
+    printf 'tabpick: pane focus failed: %s\n' "$response" >&2
+    exit 1
+  }
+}
+
 case "${1:-}" in
-  list) candidates; exit 0 ;;
-  new)  new_project "${2:-}"; exit 0 ;;
+  list)     candidates; exit 0 ;;
+  new)      new_project "${2:-}"; exit 0 ;;
+  right)    on_right "$2" "$3"; exit 0 ;;
+  left)     on_left "$2" "$3" "$4"; exit 0 ;;
+  open-all) open_all_tabs; exit 0 ;;
+  close)    close_rows "$2"; exit 0 ;;
 esac
 
-for cmd in fzf jq; do
+for cmd in fzf jq nc; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     printf 'tabpick: %s not found in PATH\n' "$cmd" >&2
     exit 1
@@ -177,10 +277,14 @@ if ! "$HERDR" workspace list >/dev/null 2>&1; then
   exit 1
 fi
 
-self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
+# The tabs opened into their panes, one tab_id per line. It lives only as long
+# as one picker run: this process creates it, and fzf's children reach it
+# through the environment.
+TABPICK_OPEN_TABS=$(mktemp "${TMPDIR:-/tmp}/tabpick.XXXXXX")
+export TABPICK_OPEN_TABS
+trap 'rm -f "$TABPICK_OPEN_TABS"' EXIT
 
-# {+2} yields tab_ids (w7:t2) and directory paths; only tab_ids get closed
-close_selected="execute-silent(for t in {+2}; do case \"\$t\" in *:t*) \"\$HERDR\" tab close \"\$t\";; esac; done)+reload('$self' list)+deselect-all"
+close_selected="execute-silent('$self' close {+f})+reload('$self' list)+deselect-all"
 nav_keys='j,k,l,h,q,g,G,x,/'
 
 selected=$(
@@ -189,18 +293,21 @@ selected=$(
     --delimiter=$'\t' \
     --with-nth=4 \
     --no-sort \
+    --id-nth=6 \
     --multi \
     --reverse \
     --prompt='tab> ' \
-    --header='j/k move · l open · h/q quit · x close · ctrl-n new · tab select · / search' \
-    --bind 'j:down,k:up,l:accept,h:abort,q:abort,g:first,G:last' \
+    --header='j/k move · l open/expand · h collapse · q quit · x close · ctrl-n new · tab select · / search' \
+    --bind 'j:down,k:up,q:abort,g:first,G:last' \
+    --bind "l:transform('$self' right {6} {7})" \
+    --bind "h:transform('$self' left {1} {6} {7})" \
     --bind "x:$close_selected" \
     --bind "ctrl-x:$close_selected" \
     --bind "ctrl-n:become('$self' new {q})" \
-    --bind "/:clear-query+change-prompt(/> )+unbind($nav_keys)" \
+    --bind "/:execute-silent('$self' open-all)+clear-query+change-prompt(/> )+unbind($nav_keys)+$reload_list" \
     --bind "esc:transform:[[ \$FZF_PROMPT == '/> ' ]] && echo 'change-prompt(tab> )+rebind($nav_keys)' || echo abort" \
     --preview='
-      if [ {1} = T ]; then
+      if [ {1} != D ]; then
         "$HERDR" pane read {3} --source visible --format ansi 2>/dev/null \
           || echo "(no pane output)"
       else
@@ -226,11 +333,14 @@ selected=$(
 
 [[ -z "$selected" ]] && exit 0
 
-IFS=$'\t' read -r sel_type sel_target _pane _display _cwd <<<"${selected%%$'\n'*}"
+IFS=$'\t' read -r sel_type sel_target _ <<<"${selected%%$'\n'*}"
 
 case "$sel_type" in
   T)
     "$HERDR" tab focus "$sel_target" >/dev/null
+    ;;
+  P)
+    focus_pane "$sel_target"
     ;;
   D)
     [[ -d "$sel_target" ]] || { printf 'tabpick: not a directory: %s\n' "$sel_target" >&2; exit 1; }
