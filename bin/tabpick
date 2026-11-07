@@ -61,23 +61,35 @@ roots() {
   done <"$file"
 }
 
+# The workspace list followed by each workspace's tab list and pane list, as
+# one JSON stream.
+fetch_tabs() {
+  local ws_json
+  ws_json=$("$HERDR" workspace list)
+  printf '%s\n' "$ws_json"
+  jq -r '.result.workspaces[].workspace_id' <<<"$ws_json" \
+    | while read -r wid; do
+        "$HERDR" tab list --workspace "$wid"
+        "$HERDR" pane list --workspace "$wid"
+      done
+}
+
 # Fields (tab-separated): type, target, preview pane, display, cwd.
 #   type T → target is a tab_id, preview pane is its focused/first pane
 #   type D → target is a directory, preview pane is "-"
 # cwd stays absolute for deduping; the display copy is ~-shortened.
 list_tabs() {
-  local ws_json mru=""
-  ws_json=$("$HERDR" workspace list)
+  local mru=""
   # -tr lists oldest first, which is the order the $rank map below expects
   [[ -d "$MRU_DIR" ]] && mru=$(ls -tr "$MRU_DIR")
-  {
-    printf '%s\n' "$ws_json"
-    jq -r '.result.workspaces[].workspace_id' <<<"$ws_json" \
-      | while read -r wid; do
-          "$HERDR" tab list --workspace "$wid"
-          "$HERDR" pane list --workspace "$wid"
-        done
-  } | jq -rs --arg home "$HOME" --arg mru "$mru" '
+  fetch_tabs | jq -rs --arg home "$HOME" --arg mru "$mru" '
+    def short: if startswith($home) then "~" + .[($home | length):] else . end;
+    def status:
+      {blocked: "\u001b[31m● blocked\u001b[0m",
+       working: "\u001b[33m● working\u001b[0m",
+       done:    "\u001b[32m● done\u001b[0m",
+       idle:    "\u001b[90m● idle\u001b[0m"}[. // ""] // ""
+      | if . != "" then "  " + . else . end;
     map(.result)
     | ([.[] | select(.type == "workspace_list").workspaces[]]) as $ws
     | ($ws | map({key: .workspace_id, value: .label}) | from_entries) as $wsl
@@ -93,24 +105,19 @@ list_tabs() {
     | ($panes[.tab_id] // []) as $pp
     | (($pp | map(select(.focused))) + $pp)[0] as $p0
     | ($p0.foreground_cwd // $p0.cwd // "") as $abs
-    | ($abs | if startswith($home) then "~" + .[($home | length):] else . end) as $cwd
     | ([$pp[].agent? // empty] | unique | join(" ")) as $agents
-    | ({blocked: "[31m● blocked[0m",
-        working: "[33m● working[0m",
-        done:    "[32m● done[0m",
-        idle:    "[90m● idle[0m"}[.agent_status // ""] // "") as $status
     # the workspace is noise until there is more than one of them
+    | (if ($ws | length) > 1 then 14 else 3 end) as $colw
     | (if ($ws | length) > 1
-       then (($wsl[.workspace_id] // .workspace_id) + ":" + (.number | tostring)
-              + "              ")[0:14]
-       else ((.number | tostring) + "   ")[0:3]
+       then ($wsl[.workspace_id] // .workspace_id) + ":" + (.number | tostring)
+       else .number | tostring
        end) as $col
     | [ "T", .tab_id, ($p0.pane_id // "-"),
-        ("[34m" + $col + "[0m " + .label
-          + (if .pane_count > 1 then " [33m(\(.pane_count)p)[0m" else "" end)
-          + (if $agents != "" then " [35m\($agents)[0m" else "" end)
-          + (if $status != "" then "  " + $status else "" end)
-          + "  [90m\($cwd)[0m"),
+        ("\u001b[34m" + (($col + " " * $colw)[0:$colw]) + "\u001b[0m " + .label
+          + (if .pane_count > 1 then " \u001b[33m(\(.pane_count)p)\u001b[0m" else "" end)
+          + (if $agents != "" then " \u001b[35m\($agents)\u001b[0m" else "" end)
+          + (.agent_status | status)
+          + "  \u001b[90m\($abs | short)\u001b[0m"),
         $abs
       ]
     | @tsv'
